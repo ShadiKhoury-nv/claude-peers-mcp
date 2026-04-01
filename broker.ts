@@ -23,8 +23,12 @@ import type {
   Message,
 } from "./shared/types.ts";
 
+import { hostname } from "node:os";
+
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
+const BROKER_MACHINE = hostname();
+const STALE_PEER_TIMEOUT_MS = 45_000; // Peers not seen in 45s are removed
 
 // --- Database setup ---
 
@@ -36,6 +40,7 @@ db.run(`
   CREATE TABLE IF NOT EXISTS peers (
     id TEXT PRIMARY KEY,
     pid INTEGER NOT NULL,
+    machine TEXT NOT NULL DEFAULT 'unknown',
     cwd TEXT NOT NULL,
     git_root TEXT,
     tty TEXT,
@@ -44,6 +49,13 @@ db.run(`
     last_seen TEXT NOT NULL
   )
 `);
+
+// Migration: add machine column if upgrading from older schema
+try {
+  db.run(`ALTER TABLE peers ADD COLUMN machine TEXT NOT NULL DEFAULT 'unknown'`);
+} catch {
+  // Column already exists — expected on subsequent runs
+}
 
 db.run(`
   CREATE TABLE IF NOT EXISTS messages (
@@ -58,15 +70,37 @@ db.run(`
   )
 `);
 
-// Clean up stale peers (PIDs that no longer exist) on startup
+// Clean up stale peers — uses heartbeat timeout instead of PID checks
+// so it works for both local and remote (tunneled) peers.
+// Local peers also get a PID check as a fast path.
 function cleanStalePeers() {
-  const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
+  const now = Date.now();
+  const peers = db.query("SELECT id, pid, machine, last_seen FROM peers").all() as {
+    id: string;
+    pid: number;
+    machine: string;
+    last_seen: string;
+  }[];
   for (const peer of peers) {
-    try {
-      // Check if process is still alive (signal 0 doesn't kill, just checks)
-      process.kill(peer.pid, 0);
-    } catch {
-      // Process doesn't exist, remove it
+    const lastSeen = new Date(peer.last_seen).getTime();
+    const isLocal = peer.machine === BROKER_MACHINE;
+    let isStale = false;
+
+    if (isLocal) {
+      // Local peer: fast PID check (original behavior)
+      try {
+        process.kill(peer.pid, 0);
+      } catch {
+        isStale = true;
+      }
+    }
+
+    // All peers (local + remote): heartbeat timeout
+    if (!isStale && now - lastSeen > STALE_PEER_TIMEOUT_MS) {
+      isStale = true;
+    }
+
+    if (isStale) {
       db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
       db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
     }
@@ -81,8 +115,8 @@ setInterval(cleanStalePeers, 30_000);
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, pid, machine, cwd, git_root, tty, summary, registered_at, last_seen)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateLastSeen = db.prepare(`
@@ -138,14 +172,15 @@ function generateId(): string {
 function handleRegister(body: RegisterRequest): RegisterResponse {
   const id = generateId();
   const now = new Date().toISOString();
+  const machine = body.machine || "unknown";
 
-  // Remove any existing registration for this PID (re-registration)
-  const existing = db.query("SELECT id FROM peers WHERE pid = ?").get(body.pid) as { id: string } | null;
+  // Remove any existing registration for this PID+machine combo (re-registration)
+  const existing = db.query("SELECT id FROM peers WHERE pid = ? AND machine = ?").get(body.pid, machine) as { id: string } | null;
   if (existing) {
     deletePeer.run(existing.id);
   }
 
-  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now);
+  insertPeer.run(id, body.pid, machine, body.cwd, body.git_root, body.tty, body.summary, now, now);
   return { id };
 }
 
@@ -184,16 +219,28 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
     peers = peers.filter((p) => p.id !== body.exclude_id);
   }
 
-  // Verify each peer's process is still alive
+  // Filter out stale peers (heartbeat-based, works for local + remote)
+  const now = Date.now();
   return peers.filter((p) => {
-    try {
-      process.kill(p.pid, 0);
-      return true;
-    } catch {
-      // Clean up dead peer
+    const lastSeen = new Date(p.last_seen).getTime();
+    const isLocal = p.machine === BROKER_MACHINE;
+
+    // Local peers: fast PID check
+    if (isLocal) {
+      try {
+        process.kill(p.pid, 0);
+      } catch {
+        deletePeer.run(p.id);
+        return false;
+      }
+    }
+
+    // All peers: heartbeat timeout
+    if (now - lastSeen > STALE_PEER_TIMEOUT_MS) {
       deletePeer.run(p.id);
       return false;
     }
+    return true;
   });
 }
 
