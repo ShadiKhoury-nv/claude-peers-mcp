@@ -24,6 +24,7 @@ import type {
   Peer,
   RegisterResponse,
   PollMessagesResponse,
+  ViewMessagesResponse,
   Message,
 } from "./shared/types.ts";
 import {
@@ -40,6 +41,10 @@ const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
+// Marker file: this machine reaches the broker through an SSH tunnel and must
+// NEVER spawn a local broker (an island broker squats the port and blocks the
+// tunnel — see project_claude_peers_mcp.md "island mode").
+const REMOTE_MARKER = `${process.env.HOME}/.claude-peers-remote`;
 
 // --- Broker communication ---
 
@@ -68,6 +73,11 @@ async function isBrokerAlive(): Promise<boolean> {
 async function ensureBroker(): Promise<void> {
   if (await isBrokerAlive()) {
     log("Broker already running");
+    return;
+  }
+
+  if (await Bun.file(REMOTE_MARKER).exists()) {
+    log("Remote mode: broker unreachable (tunnel down?) — will register once it appears");
     return;
   }
 
@@ -222,7 +232,21 @@ const TOOLS = [
   {
     name: "check_messages",
     description:
-      "Manually check for new messages from other Claude Code instances. Messages are normally pushed automatically via channel notifications, but you can use this as a fallback.",
+      "View messages sent to this peer in the recent past. Returns messages whether or not they were already auto-delivered to the channel — use this when you suspect a message was silently consumed by the background poll, or when you want to re-read context. Default window: 5 minutes.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        window_seconds: {
+          type: "number" as const,
+          description: "How far back to look (default 300s / 5 minutes). Max useful value ~3600s.",
+        },
+      },
+    },
+  },
+  {
+    name: "whoami",
+    description:
+      "Return this peer's broker-assigned ID, machine, PID, CWD, and git root. Use this when you need to tell another peer how to address you, or when debugging peer-ID confusion.",
     inputSchema: {
       type: "object" as const,
       properties: {},
@@ -366,20 +390,30 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
       try {
-        const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
+        const windowSeconds = (args as { window_seconds?: number })?.window_seconds ?? 300;
+        const result = await brokerFetch<ViewMessagesResponse>("/view-messages", {
+          id: myId,
+          window_seconds: windowSeconds,
+        });
         if (result.messages.length === 0) {
           return {
-            content: [{ type: "text" as const, text: "No new messages." }],
+            content: [
+              {
+                type: "text" as const,
+                text: `No messages in the last ${windowSeconds}s.`,
+              },
+            ],
           };
         }
         const lines = result.messages.map(
-          (m) => `From ${m.from_id} (${m.sent_at}):\n${m.text}`
+          (m) =>
+            `From ${m.from_id} (${m.sent_at}, delivered=${m.delivered ? "yes" : "no"}):\n${m.text}`
         );
         return {
           content: [
             {
               type: "text" as const,
-              text: `${result.messages.length} new message(s):\n\n${lines.join("\n\n---\n\n")}`,
+              text: `${result.messages.length} message(s) in the last ${windowSeconds}s:\n\n${lines.join("\n\n---\n\n")}`,
             },
           ],
         };
@@ -394,6 +428,25 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           isError: true,
         };
       }
+    }
+
+    case "whoami": {
+      if (!myId) {
+        return {
+          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          isError: true,
+        };
+      }
+      const lines = [
+        `Peer ID: ${myId}`,
+        `Machine: ${hostname()}`,
+        `PID: ${process.pid}`,
+        `CWD: ${myCwd}`,
+        `Git root: ${myGitRoot ?? "(none)"}`,
+      ];
+      return {
+        content: [{ type: "text" as const, text: lines.join("\n") }],
+      };
     }
 
     default:
@@ -492,18 +545,27 @@ async function main() {
   // Wait briefly for summary, but don't block startup
   await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
 
-  // 4. Register with broker
+  // 4. Register with broker (tolerates a down tunnel — retried from the heartbeat loop)
   const myMachine = hostname();
-  const reg = await brokerFetch<RegisterResponse>("/register", {
-    pid: process.pid,
-    machine: myMachine,
-    cwd: myCwd,
-    git_root: myGitRoot,
-    tty,
-    summary: initialSummary,
-  });
-  myId = reg.id;
-  log(`Registered as peer ${myId} on ${myMachine}`);
+  const tryRegister = async (): Promise<boolean> => {
+    try {
+      const reg = await brokerFetch<RegisterResponse>("/register", {
+        pid: process.pid,
+        machine: myMachine,
+        cwd: myCwd,
+        git_root: myGitRoot,
+        tty,
+        summary: initialSummary,
+      });
+      myId = reg.id;
+      log(`Registered as peer ${myId} on ${myMachine}`);
+      return true;
+    } catch (e) {
+      log(`Register failed (broker unreachable?): ${e instanceof Error ? e.message : String(e)}`);
+      return false;
+    }
+  };
+  await tryRegister();
 
   // If summary generation is still running, update it when done
   if (!initialSummary) {
@@ -526,14 +588,24 @@ async function main() {
   // 6. Start polling for inbound messages
   const pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
 
-  // 7. Start heartbeat
+  // 7. Start heartbeat — also self-heals: registers late (tunnel was down at
+  // startup) and re-registers if the broker stale-deleted us during a tunnel drop.
   const heartbeatTimer = setInterval(async () => {
-    if (myId) {
-      try {
-        await brokerFetch("/heartbeat", { id: myId });
-      } catch {
-        // Non-critical
+    if (!myId) {
+      await tryRegister();
+      return;
+    }
+    try {
+      const res = await brokerFetch<{ ok: boolean; known?: boolean }>("/heartbeat", {
+        id: myId,
+      });
+      if (res.known === false) {
+        log(`Broker forgot peer ${myId} — re-registering`);
+        myId = null;
+        await tryRegister();
       }
+    } catch {
+      // Non-critical
     }
   }, HEARTBEAT_INTERVAL_MS);
 

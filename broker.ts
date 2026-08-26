@@ -19,6 +19,8 @@ import type {
   SendMessageRequest,
   PollMessagesRequest,
   PollMessagesResponse,
+  ViewMessagesRequest,
+  ViewMessagesResponse,
   Peer,
   Message,
 } from "./shared/types.ts";
@@ -156,6 +158,16 @@ const markDelivered = db.prepare(`
   UPDATE messages SET delivered = 1 WHERE id = ?
 `);
 
+// Read-only inspection: returns messages sent to this peer within the
+// recency window, regardless of delivered flag. Used by the user-facing
+// check_messages tool so background polling doesn't drain the inbox.
+const selectRecent = db.prepare(`
+  SELECT * FROM messages
+  WHERE to_id = ?
+    AND datetime(sent_at) > datetime('now', ?)
+  ORDER BY sent_at ASC
+`);
+
 // --- Generate peer ID ---
 
 function generateId(): string {
@@ -184,8 +196,14 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
   return { id };
 }
 
-function handleHeartbeat(body: HeartbeatRequest): void {
-  updateLastSeen.run(new Date().toISOString(), body.id);
+// Reports whether the peer is still known so a tunneled server whose row was
+// stale-deleted during a tunnel drop knows to re-register.
+function handleHeartbeat(body: HeartbeatRequest): { ok: boolean; known: boolean } {
+  const known = !!db.query("SELECT 1 FROM peers WHERE id = ?").get(body.id);
+  if (known) {
+    updateLastSeen.run(new Date().toISOString(), body.id);
+  }
+  return { ok: true, known };
 }
 
 function handleSetSummary(body: SetSummaryRequest): void {
@@ -266,6 +284,15 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
   return { messages };
 }
 
+function handleViewMessages(body: ViewMessagesRequest): ViewMessagesResponse {
+  // Default to a 5-minute window — long enough to recover anything the
+  // background poll already drained but short enough to keep the response small.
+  const windowSec = body.window_seconds ?? 300;
+  const sqlOffset = `-${Math.max(1, Math.floor(windowSec))} seconds`;
+  const messages = selectRecent.all(body.id, sqlOffset) as Message[];
+  return { messages };
+}
+
 function handleUnregister(body: { id: string }): void {
   deletePeer.run(body.id);
 }
@@ -293,8 +320,7 @@ Bun.serve({
         case "/register":
           return Response.json(handleRegister(body as RegisterRequest));
         case "/heartbeat":
-          handleHeartbeat(body as HeartbeatRequest);
-          return Response.json({ ok: true });
+          return Response.json(handleHeartbeat(body as HeartbeatRequest));
         case "/set-summary":
           handleSetSummary(body as SetSummaryRequest);
           return Response.json({ ok: true });
@@ -304,6 +330,8 @@ Bun.serve({
           return Response.json(handleSendMessage(body as SendMessageRequest));
         case "/poll-messages":
           return Response.json(handlePollMessages(body as PollMessagesRequest));
+        case "/view-messages":
+          return Response.json(handleViewMessages(body as ViewMessagesRequest));
         case "/unregister":
           handleUnregister(body as { id: string });
           return Response.json({ ok: true });

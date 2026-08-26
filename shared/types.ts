@@ -67,3 +67,16 @@ export interface PollMessagesRequest {
 export interface PollMessagesResponse {
   messages: Message[];
 }
+
+// Read-only message inspection — does NOT mark messages delivered.
+// Returns recently-sent messages within `window_seconds` (default 300).
+// Use this for the user-facing `check_messages` tool so background
+// polling does not race the user out of their own inbox.
+export interface ViewMessagesRequest {
+  id: PeerId;
+  window_seconds?: number;
+}
+
+export interface ViewMessagesResponse {
+  messages: Message[];
+}
