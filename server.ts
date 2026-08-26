@@ -32,6 +32,7 @@ import {
   getGitBranch,
   getRecentFiles,
 } from "./shared/summarize.ts";
+import { sessionSummary } from "./shared/session-context.ts";
 import { hostname } from "node:os";
 
 // --- Configuration ---
@@ -149,6 +150,8 @@ function getTty(): string | null {
 let myId: PeerId | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+// An agent-set summary (set_summary tool) wins over transcript auto-refresh.
+let summaryIsManual = false;
 
 // --- MCP Server ---
 
@@ -366,6 +369,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
       try {
         await brokerFetch("/set-summary", { id: myId, summary });
+        summaryIsManual = true;
         return {
           content: [{ type: "text" as const, text: `Summary updated: "${summary}"` }],
         };
@@ -521,9 +525,12 @@ async function main() {
   log(`Git root: ${myGitRoot ?? "(none)"}`);
   log(`TTY: ${tty ?? "(unknown)"}`);
 
-  // 3. Generate initial summary via gpt-5.4-nano (non-blocking, best-effort)
-  let initialSummary = "";
+  // 3. Initial summary: the session's own transcript first (free, specific),
+  // gpt-5.4-nano guess as fallback (non-blocking, best-effort)
+  let initialSummary = sessionSummary() ?? "";
+  if (initialSummary) log(`Transcript summary: ${initialSummary}`);
   const summaryPromise = (async () => {
+    if (initialSummary) return;
     try {
       const branch = await getGitBranch(myCwd);
       const recentFiles = await getRecentFiles(myCwd);
@@ -609,10 +616,27 @@ async function main() {
     }
   }, HEARTBEAT_INTERVAL_MS);
 
+  // 7b. Auto-refresh the summary from the session transcript so list_peers
+  // shows what each session is doing now, not what it did at startup.
+  // An explicit set_summary by the agent turns this off.
+  let lastAutoSummary = initialSummary;
+  const summaryTimer = setInterval(async () => {
+    if (!myId || summaryIsManual) return;
+    const current = sessionSummary();
+    if (!current || current === lastAutoSummary) return;
+    try {
+      await brokerFetch("/set-summary", { id: myId, summary: current });
+      lastAutoSummary = current;
+    } catch {
+      // Non-critical — retried next tick
+    }
+  }, 60_000);
+
   // 8. Clean up on exit
   const cleanup = async () => {
     clearInterval(pollTimer);
     clearInterval(heartbeatTimer);
+    clearInterval(summaryTimer);
     if (myId) {
       try {
         await brokerFetch("/unregister", { id: myId });
